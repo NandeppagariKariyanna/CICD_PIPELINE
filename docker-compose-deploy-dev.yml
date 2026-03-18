@@ -1,0 +1,168 @@
+version: "3.9"
+
+services:
+  # ============================
+  # API GATEWAY
+  # ============================
+  api-gateway:
+    image: alicebluedoc/ekycdev-api-gateway
+
+    container_name: api-gateway
+    command: ["/app/api-gateway.bin"]
+    env_file:
+      - .env
+    environment:
+      - SERVICE=api-gateway
+      - KAFKA_BROKERS=kafka:29092
+    ports:
+      - "8081:8081"
+    depends_on:
+      - auth-service
+      - vm-service
+    restart: always
+    networks:
+      ekyc_go:
+        ipv4_address: 172.30.0.2
+        
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    # ✅ Persistent logs 
+    volumes:
+      - /var/log/goekyc:/shared/storage/logs
+    # ✅ Writable temp/cache only
+    tmpfs:
+      - /tmp
+      - /app/.cache:uid=1000,gid=1000
+
+  # ============================
+  # AUTH SERVICE
+  # ============================
+  auth-service:
+    image: alicebluedoc/ekycdev-auth-service
+    container_name: auth-service
+    command: ["/app/auth-service.bin"]
+    env_file:
+      - .env
+    environment:
+      - SERVICE=auth-service
+      - EMAIL_TEMPLATES_PATH=/app/email-templates
+      - KAFKA_BROKERS=kafka:29092
+    restart: always
+    networks:
+      ekyc_go:
+        ipv4_address: 172.30.0.3
+     # 🔐 Security
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+    # ✅ Persistent logs 
+    volumes:
+      - auth_logs:/app/internal/storage/logs
+      - /var/log/goekyc:/shared/storage/logs
+
+    # ✅ Writable runtime dirs
+    tmpfs:
+      - /tmp
+      - /app/.cache:uid=1000,gid=1000
+
+  # ============================
+  # VM SERVICE
+  # ============================
+  vm-service:
+    image: alicebluedoc/ekycdev-vm-service
+    container_name: vm-service
+    command: ["/app/vm-service.bin"]
+    env_file:
+      - .env
+    environment:
+      - SERVICE=vm-service
+      - EMAIL_TEMPLATES_PATH=/app/verification-email-templates
+      - PDF_TEMPLATES_PATH=/app/templates
+      - KAFKA_BROKERS=kafka:29092
+    restart: always
+    networks:
+      ekyc_go:
+        ipv4_address: 172.30.0.4
+    # 🔐 Security
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+    # ✅ Persistent data
+    volumes:
+      - vm_logs:/app/internal/storage/logs
+      - vm_documents:/app/dev/account_document
+      - /var/log/goekyc:/shared/storage/logs
+
+    # ✅ Writable runtime dirs
+    tmpfs:
+      - /tmp
+      - /app/.cache:uid=1000,gid=1000
+
+
+  notification-service:
+    image: alicebluedoc/ekycdev-notification-service
+    container_name: notification-service
+    command: ["/app/notification-service.bin"]
+    env_file:
+      - .env
+    environment:
+      - SERVICE=notification-service
+      - KAFKA_BROKERS=kafka:29092
+    ports:
+      - "8084:8084"
+    restart: always
+    networks:
+      ekyc_go:
+        ipv4_address: 172.30.0.20
+    # 🔐 Security
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+    # ✅ Persistent data
+    volumes:
+      - notification_logs:/app/internal/storage/logs
+      - /var/log/goekyc:/shared/storage/logs
+
+    # ✅ Writable runtime dirs
+    tmpfs:
+      - /tmp
+      - /app/.cache:uid=1000,gid=1000
+
+   
+
+  # ============================
+  # REDIS (Same Network)
+  # ============================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: always
+    networks:
+      ekyc_go:
+        ipv4_address: 172.30.0.5
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+    tmpfs:
+      - /tmp
+# ============================
+# VOLUMES 
+# ============================
+volumes:
+  auth_logs:
+  vm_logs:
+  vm_documents:
+  notification_logs:
+
+ 
+# ============================
+# NETWORK DEFINITION
+# ============================
+networks:
+  ekyc_go:
+    external: true
