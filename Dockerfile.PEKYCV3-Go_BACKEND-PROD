@@ -1,0 +1,62 @@
+# ==============================
+# STAGE 1: Build Stage
+# ==============================
+FROM golang:1.24.13-alpine3.23 AS builder
+
+WORKDIR /app
+
+# 1. Install build tools
+RUN apk add --no-cache git tzdata
+
+# 2. Cache Go modules
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 3. Install swag
+RUN go install github.com/swaggo/swag/cmd/swag@latest
+
+# 4. Copy source code
+COPY . .
+
+# 5. Generate Swagger docs
+RUN swag init -g cmd/server/main.go -o api/openapi
+
+# 6. Build binary (STATIC)
+RUN CGO_ENABLED=0 GOOS=linux go build -o main ./cmd/server/main.go
+
+
+# ==============================
+# STAGE 2: Runtime (NON-ROOT)
+# ==============================
+FROM alpine:3.23
+
+# Runtime deps (zlib added for safety)
+RUN apk add --no-cache \
+    ca-certificates \
+    chromium \
+    tzdata \
+    netcat-openbsd \
+    zlib
+
+#set timezone
+ENV TZ=Asia/Kolkata
+
+# Define chromium binary path for libraries/frameworks that expect it
+ENV CHROME_PATH=/usr/bin/chromium-browser
+
+# ---- Create non-root user pekyc ----
+RUN addgroup -S pekyc && adduser -S pekyc -G pekyc
+
+WORKDIR /app
+
+# Copy binary
+COPY --from=builder /app/main /app/main
+
+# Fix ownership
+RUN chown -R pekyc:pekyc /app
+
+# Switch to non-root user
+USER pekyc
+
+EXPOSE 8081
+CMD ["./main"]
