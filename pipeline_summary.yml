@@ -1,0 +1,330 @@
+"""
+report.py - GitHub Actions failed pipeline reporter
+
+Generates an Excel report listing only failed workflow runs for a given day
+across selected repositories, with the failed job/step as the reason.
+
+Requires env vars:
+    GITHUB_ORG   - GitHub organization name
+    GH_TOKEN     - GitHub token with Actions read access
+
+Optional env vars:
+    REPORT_DATE  - Date to report on, format YYYY-MM-DD (defaults to today, UTC)
+"""
+
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+# --- Config -------------------------------------------------------------
+
+TOKEN = os.environ["GH_TOKEN"]
+ORG = os.environ["GITHUB_ORG"]
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Accept": "application/vnd.github+json",
+}
+
+REPOSITORIES = [
+    "EKYCV3-AdminFE", "EKYCV3-BACKADMIN", "GO-EKYC", "EKYCV3-BACK-SECADMIN",
+    "EKYC-Exchange-API", "ekyc-optimization-flow", "BOTFV3", "bot-backend-golang",
+    "bot-admin-golang", "MWARE_360_FE", "Middleware-admin-FE", "MWARE360-V3-FE",
+    "middleware-go", "Rise_Pro_Web", "MFV3_ADMIN", "Rise-Pro-Go", "PDB.V3.FrontEnd",
+    "PDBV3.GO.BACKEND", "pekycv3_frontend_admin", "PEKYC.V3.Frontend",
+    "PEKYCV3.GO.BACKEND", "itil", "HRMS_BGV_FrontEnd", "HRMS_BGV_FrontEnd_Admin",
+    "HRMS_BGV_BackEnd", "go-ipo", "Alice.Ticket.Portal", "atp-frontend",
+    "ab-content-service", "VoiceBlaster", "EmailPortalV3",
+]
+
+EXCEL_HEADERS = ["Date", "Repository", "Source Branch", "Destination Branch", "Workflow", "Run Time", "Run URL", "Reason for Failure"]
+HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+HEADER_FONT = Font(bold=True, color="FFFFFF")
+FAILED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+FAILED_FONT = Font(color="9C0006")
+
+# Report date: override with REPORT_DATE=YYYY-MM-DD, otherwise today (UTC)
+_report_date_env = os.environ.get("REPORT_DATE")
+REPORT_DATE = (
+    datetime.strptime(_report_date_env, "%Y-%m-%d").date()
+    if _report_date_env
+    else datetime.now(timezone.utc).date()
+)
+
+REQUEST_TIMEOUT = 30  # seconds
+
+
+# --- HTTP session with retries --------------------------------------------
+
+def build_session() -> requests.Session:
+    """Create a requests session that retries on rate limits / transient errors."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    retries = Retry(
+        total=5,
+        backoff_factor=2,  # 2s, 4s, 8s, 16s, 32s
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    return session
+
+
+SESSION = build_session()
+
+
+# --- Helpers ----------------------------------------------------------------
+
+def get_failure_step(repo: str, run_id: int) -> str:
+    """Return 'job -> step' for the first failed step in a run, or a fallback string."""
+    url = f"https://api.github.com/repos/{ORG}/{repo}/actions/runs/{run_id}/jobs"
+    try:
+        r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+    except requests.RequestException:
+        return "Workflow Failed (could not fetch job details)"
+
+    for job in r.json().get("jobs", []):
+        for step in job.get("steps", []):
+            if step.get("conclusion") == "failure":
+                return f"{job['name']} -> {step['name']}"
+    return "Workflow Failed"
+
+
+def get_base_branch(repo: str, head_branch: str, cache: dict) -> str:
+    """Look up the destination (base) branch for the most recent PR from head_branch.
+
+    Cached per repo+branch since many runs share the same branch.
+    """
+    cache_key = (repo, head_branch)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    base_branch = ""
+    url = f"https://api.github.com/repos/{ORG}/{repo}/pulls?head={ORG}:{head_branch}&state=all&per_page=1"
+    try:
+        r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        prs = r.json()
+        if prs:
+            base_branch = prs[0].get("base", {}).get("ref", "")
+    except requests.RequestException:
+        pass
+
+    cache[cache_key] = base_branch
+    return base_branch
+
+
+def fetch_repo_runs(repo: str) -> tuple:
+    """Fetch the report-date's completed runs for a repo as a flat list of row dicts.
+
+    Returns (rows, accessible) where accessible is False if the repo could not
+    be reached at all (e.g. no permissions, renamed, deleted).
+    """
+    rows = []
+    page = 1
+    accessible = True
+    base_branch_cache = {}
+
+    while True:
+        url = f"https://api.github.com/repos/{ORG}/{repo}/actions/runs?per_page=100&page={page}"
+        try:
+            r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            print(f"  [warn] {repo}: failed to fetch runs page {page} ({e})", file=sys.stderr)
+            if page == 1:
+                accessible = False
+            break
+
+        runs = r.json().get("workflow_runs", [])
+        if not runs:
+            break
+
+        reached_older_runs = False
+        for run in runs:
+            created = datetime.strptime(run["created_at"], "%Y-%m-%dT%H:%M:%SZ").date()
+
+            # Runs are returned newest-first, so older-than-target means we're done
+            if created < REPORT_DATE:
+                reached_older_runs = True
+                break
+            if created != REPORT_DATE or run["status"] != "completed":
+                continue
+
+            # Use run_started_at (when execution began) rather than created_at (when queued),
+            # so duration matches what GitHub displays in the UI and excludes queue wait time.
+            started = datetime.strptime(run["run_started_at"], "%Y-%m-%dT%H:%M:%SZ")
+            finished = datetime.strptime(run["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
+            duration_seconds = max((finished - started).total_seconds(), 0)
+
+            # head_branch is the branch the workflow ran on (source).
+            # The run object's own pull_requests array is often empty even for
+            # PR-triggered runs (a GitHub API quirk), so fall back to looking
+            # up the PR directly by head branch when that happens.
+            base_branch = ""
+            pull_requests = run.get("pull_requests") or []
+            if pull_requests:
+                base_branch = pull_requests[0].get("base", {}).get("ref", "")
+            else:
+                base_branch = get_base_branch(repo, run["head_branch"], base_branch_cache)
+
+            is_success = run["conclusion"] == "success"
+            is_failure = run["conclusion"] == "failure"
+
+            rows.append({
+                "repo": repo,
+                "branch": run["head_branch"],
+                "base_branch": base_branch,
+                "workflow": run["name"],
+                "success": 1 if is_success else 0,
+                "failed": 1 if is_failure else 0,
+                "run_time": format_duration(duration_seconds),
+                "url": run["html_url"],
+                "remarks": get_failure_step(repo, run["id"]) if is_failure else "NA",
+            })
+
+        if reached_older_runs:
+            break
+        page += 1
+
+    return rows, accessible
+
+
+def format_duration(total_seconds: float) -> str:
+    """Format seconds as H:MM:SS, omitting the hour part when under an hour."""
+    total_seconds = int(round(total_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def style_header_row(ws):
+    """Apply bold white-on-blue styling to the first row of a worksheet."""
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+
+
+def autosize_columns(ws, min_width=10, max_width=60):
+    """Resize columns to fit their longest value, within sane bounds."""
+    for col_cells in ws.columns:
+        length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=0)
+        col_letter = get_column_letter(col_cells[0].column)
+        ws.column_dimensions[col_letter].width = max(min_width, min(length + 2, max_width))
+
+
+# --- Report generation --------------------------------------------------
+
+def build_summary_sheet(wb: Workbook) -> tuple[int, int, int]:
+    """Build the 'Failed Pipelines' sheet (failures only) and return (total, success, failed) counts."""
+    ws = wb.active
+    ws.title = "Failed Pipelines"
+    ws.append(EXCEL_HEADERS)
+    style_header_row(ws)
+
+    total_runs = total_success = total_failed = 0
+    failed_rows = []
+
+    for repo in REPOSITORIES:
+        print(f"Checking {repo}")
+        repo_rows, accessible = fetch_repo_runs(repo)
+        if not accessible:
+            print(f"Unable to access {repo}")
+            continue
+
+        for run_row in repo_rows:
+            total_runs += 1
+            total_success += run_row["success"]
+            total_failed += run_row["failed"]
+
+            if run_row["failed"]:
+                failed_rows.append([
+                    REPORT_DATE.strftime("%d-%m-%Y"), run_row["repo"], run_row["branch"],
+                    run_row["base_branch"], run_row["workflow"],
+                    run_row["run_time"], run_row["url"], run_row["remarks"],
+                ])
+
+    for row in failed_rows:
+        ws.append(row)
+
+    # Highlight every data row red since this sheet is failures-only
+    if ws.max_row > 1:
+        for row_cells in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row_cells:
+                cell.fill = FAILED_FILL
+                cell.font = FAILED_FONT
+
+    autosize_columns(ws)
+    ws.freeze_panes = "A2"
+
+    return total_runs, total_success, total_failed
+
+
+def build_dashboard_sheet(wb: Workbook, total_runs: int, total_success: int, total_failed: int):
+    """Build a high-level 'Dashboard' sheet summarizing the run."""
+    dash = wb.create_sheet("Dashboard")
+    dash["A1"] = "Pipeline Summary"
+    dash["A1"].font = Font(bold=True, size=14)
+
+    success_rate = round((total_success / total_runs * 100), 2) if total_runs else 0
+    rows = [
+        ("Report Date", REPORT_DATE.strftime("%d-%m-%Y")),
+        ("Repositories Checked", len(REPOSITORIES)),
+        ("Total Pipeline Runs", total_runs),
+        ("Successful Runs", total_success),
+        ("Failed Runs", total_failed),
+        ("Success Rate", f"{success_rate}%"),
+    ]
+    for i, (label, value) in enumerate(rows, start=3):
+        dash[f"A{i}"] = label
+        dash[f"B{i}"] = value
+        dash[f"A{i}"].font = Font(bold=True)
+
+    autosize_columns(dash)
+
+
+def main():
+    start = time.time()
+
+    print("=" * 70)
+    print("Generating Pipeline Summary")
+    print(f"Date : {REPORT_DATE.strftime('%Y-%m-%d')}")
+    print("=" * 70)
+
+    wb = Workbook()
+    total_runs, total_success, total_failed = build_summary_sheet(wb)
+    build_dashboard_sheet(wb, total_runs, total_success, total_failed)
+
+    out_file = "PipelineSummary.xlsx"
+    wb.save(out_file)
+
+    success_rate = round((total_success / total_runs * 100), 2) if total_runs else 0
+
+    print("=" * 80)
+    print("Pipeline Summary Generated Successfully")
+    print("=" * 80)
+    print(f"Repositories Checked : {len(REPOSITORIES)}")
+    print(f"Total Runs           : {total_runs}")
+    print(f"Successful           : {total_success}")
+    print(f"Failed               : {total_failed}")
+    print(f"Success Rate         : {success_rate}%")
+    print("=" * 80)
+    print(f"Excel Generated : {out_file}")
+
+    elapsed = round(time.time() - start, 1)
+    print(f"(completed in {elapsed}s)")
+
+
+if __name__ == "__main__":
+    main()
